@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Раз в неделю: uvx у пользователя резолвит зависимости заново и не смотрит
+    # на uv.lock, поэтому чужой мажор надо ловить до потребителя.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  locked:
+    name: locked (uv.lock)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+      # --locked, а не uv sync: без него uv молча перелочивает при расхождении
+      # pyproject и uv.lock, и джоб с этим названием проверял бы свежий резолв.
+      - run: uv sync --locked
+      - run: uv run pytest -q
+      - run: uv run pyright
+
+  fresh:
+    name: fresh resolve (как uvx у пользователя)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # continue-on-error здесь не нужен: if выше уже не пускает джоб на push
+    # и pull_request, покрасить чужой PR он не может. Зато он делал conclusion
+    # прогона success, а GitHub уведомляет по провалу прогона — то есть падение
+    # свежего резолва не давало ни письма, ни красного бейджа.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.14"
+      - run: uv lock --upgrade
+      - run: uv sync
+      # -W default обязателен: filterwarnings = ["error"] на свежем резолве
+      # покрасил бы джоб от любого DeprecationWarning из 80 пакетов, и после
+      # третьего ложняка на бейдж перестанут смотреть. Цена известна: ровно тот
+      # DeprecationWarning про exclude_args, который предшествовал инциденту,
+      # тут будет напечатан, а не подсвечен. Смотреть в лог, а не только
+      # на статус.
+      - run: uv run pytest -q -W default
+      # Границы в pyproject этот джоб не переступает: uv lock --upgrade
+      # резолвит внутри fastmcp<5, то есть следующий мажор он не выберет
+      # и инцидент не воспроизведёт. Он ловит дрейф внутри 4.x и чужие
+      # мажоры там, где границы нет (см. TODOS про pydantic).

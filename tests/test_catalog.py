@@ -20,6 +20,16 @@ def test_every_spec_request_class_exists_upstream():
             assert inspect.isclass(getattr(pyrus_requests, spec.request, None)), spec.request
 
 
+def test_every_req_shape_names_a_request_class():
+    """Проверка выше сама пропускает строку с request=None, а регистрация её
+    не ловит: _spec_keys при пустом spec.request падает в сигнатуру метода,
+    и инструмент заводится штатно, чтобы взорваться на первом вызове. Здесь
+    проверяется весь каталог сразу, в отличие от assert в _build_request,
+    которого нет под python -O."""
+    missing = [s.method for s in CATALOG if s.shape in (Shape.REQ, Shape.ID_REQ) and not s.request]
+    assert missing == []
+
+
 def test_no_upstream_method_is_missing_from_the_table():
     """Обратная сверка: новый метод в pyrus-api не должен пройти незамеченным."""
     upstream = {
@@ -73,7 +83,9 @@ def test_non_destructive_hides_deletes_but_keeps_sync_catalog():
 
 
 def _guard(method):
-    return next(s.guard for s in CATALOG if s.method == method)
+    guard = next(s.guard for s in CATALOG if s.method == method)
+    assert guard is not None, method
+    return guard
 
 
 @pytest.mark.parametrize(

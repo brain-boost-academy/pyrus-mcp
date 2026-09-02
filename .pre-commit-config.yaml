@@ -1,0 +1,18 @@
+# pyright запускается через uv, а не через зеркало RobertCraigie/pyright-python:
+# зеркало создаёт своё окружение без fastmcp и pyrus, и проверка легла бы на
+# нерезолвнутых импортах. Цена: коммитеру нужен uv в PATH.
+repos:
+  - repo: local
+    hooks:
+      - id: pyright
+        name: pyright
+        # --frozen, потому что uv run по умолчанию синкает: на устаревшем локе
+        # хук переписал бы uv.lock внутри коммита, и pre-commit упал бы
+        # с «files were modified by this hook», списав это на pyright.
+        entry: uv run --frozen pyright
+        language: system
+        # always_run вместо types: [python] — коммит, трогающий только
+        # pyproject.toml (границу зависимости или сам блок [tool.pyright]),
+        # иначе не запускает ничего, а именно такой коммит и сломал сервер.
+        always_run: true
+        pass_filenames: false
