@@ -5,7 +5,8 @@ description = "MCP-сервер поверх официальной библио
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "fastmcp>=3.4.5",
+    "fastmcp>=4.0.1,<5",
+    "jsonpickle",
     "pyrus-api==2.48.0",
 ]
 license = "LicenseRef-PolyForm-Strict-1.0.0"
@@ -26,9 +27,4 @@ packages = ["src/pyrus_mcp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-filterwarnings = [
-    "error",
-    # exclude_args помечен deprecated, но остаётся рабочим способом убрать
-    # offset из схемы пишущих инструментов. См. ponytail-комментарий в server.py.
-    "ignore:The `exclude_args` parameter is deprecated",
-]
+filterwarnings = ["error"]

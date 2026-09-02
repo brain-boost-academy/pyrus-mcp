@@ -22,7 +22,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pyrus.client import PyrusAPI
 
-from .catalog import CATALOG, Level, Mode, Shape, Spec, visible
+from .catalog import CATALOG, Mode, Shape, Spec, visible
 
 DEFAULT_MAX_RESULT_BYTES = 256 * 1024
 
@@ -275,16 +275,7 @@ def _register(mcp: FastMCP, client: PyrusAPI, spec: Spec, mode: Mode, max_bytes:
     if spec.shape in (Shape.BY_ID, Shape.ID_REQ):
         description = f"Первый аргумент entity_id — это {spec.id_arg}. {description}"
 
-    mcp.tool(
-        tool,
-        name=spec.method,
-        description=description,
-        # offset нужен только там, где результат бывает большим; на пишущих
-        # инструментах он был бы шумом в схеме.
-        # ponytail: exclude_args помечен в FastMCP как deprecated. Если его
-        # уберут — развести формы на варианты с offset и без.
-        exclude_args=None if spec.level is Level.READ else ["offset"],
-    )
+    mcp.tool(tool, name=spec.method, description=description)
 
 
 def _register_one_offs(

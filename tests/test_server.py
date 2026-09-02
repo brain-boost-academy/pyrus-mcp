@@ -357,14 +357,39 @@ def test_full_mode_lets_the_guarded_field_through():
     assert client.calls[0][0] == "update_catalog_items"
 
 
-def test_offset_is_hidden_on_writing_tools():
+def test_offset_is_offered_everywhere_including_writing_tools():
+    """Пишущие инструменты тоже отдают списки: sync_catalog в non-destructive
+    живёт только как dry-run «верни весь дифф», и без offset второе окно
+    диффа недостижимо. Проверка required ловит и схлопывание схемы целиком."""
+
     async def go():
         async with Client(_build(FakeClient(), Mode.FULL)) as c:
-            return {t.name: t.inputSchema.get("properties", {}) for t in await c.list_tools()}
+            return {t.name: t.input_schema for t in await c.list_tools()}
 
-    props = asyncio.run(go())
+    schemas = asyncio.run(go())
+    props = {n: s.get("properties", {}) for n, s in schemas.items()}
     assert "offset" in props["get_registry"]
-    assert "offset" not in props["create_task"]
+    assert "offset" in props["sync_catalog"]
+    assert set(props["create_task"]) == {"request", "offset"}
+    assert schemas["create_task"].get("required") == ["request"]
+
+
+def test_offset_reaches_pagination_through_the_tool():
+    """Единственное непроверенное звено offset-контракта: провода от параметра
+    инструмента до _adapt. Остальные проверки зовут _adapt/_paginate напрямую."""
+    payload = {"tasks": [{"id": i} for i in range(10)]}
+    out = _call(
+        _build(FakeClient(result=FakeResponse(payload)), Mode.READ_ONLY),
+        "get_forms",
+        {"offset": 5},
+    )
+    assert out.data["_pagination"] == {
+        "field": "tasks",
+        "offset": 5,
+        "returned": 5,
+        "total": 10,
+        "next_offset": None,
+    }
 
 
 # --- download_file: инлайн, без записи на диск -----------------------------
