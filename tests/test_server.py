@@ -3,11 +3,13 @@
 import asyncio
 import json
 from dataclasses import replace
+from typing import cast
 
 import pytest
 from conftest import FakeClient, FakeResponse
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
+from pyrus.client import PyrusAPI
 
 from pyrus_mcp import server
 from pyrus_mcp.catalog import CATALOG, Mode, Shape
@@ -282,7 +284,7 @@ def test_non_destructive_omits_deletes_from_tools_list():
 
 def test_instructions_name_the_active_mode():
     mcp = _build(FakeClient(), Mode.READ_ONLY)
-    assert "read-only" in mcp.instructions
+    assert "read-only" in (mcp.instructions or "")
 
 
 def test_every_registered_tool_has_a_description():
@@ -354,7 +356,7 @@ def test_guard_also_fires_on_option_carrying_shapes():
     )
     client = FakeClient()
     mcp = server.FastMCP(name="t")
-    server._register(mcp, client, spec, Mode.NON_DESTRUCTIVE, 65536)
+    server._register(mcp, cast(PyrusAPI, client), spec, Mode.NON_DESTRUCTIVE, 65536)
     with pytest.raises(ToolError, match="filters"):
         _call(mcp, "get_catalog", {"entity_id": 1, "options": {"filters": {"a": 1}}})
     assert client.calls == []

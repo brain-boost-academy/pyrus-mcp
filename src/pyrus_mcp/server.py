@@ -13,7 +13,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn, overload
 
 import jsonpickle
 import pyrus.models.entities as entities
@@ -99,7 +99,8 @@ def _to_plain(result: Any) -> Any:
     raw = getattr(result, "original_response", None)
     if isinstance(raw, dict) and raw:
         return raw
-    return json.loads(jsonpickle.encode(result, unpicklable=False, keys=True))
+    encoded: Any = jsonpickle.encode(result, unpicklable=False, keys=True)
+    return json.loads(encoded)
 
 
 def _longest_list_key(data: Any) -> str | None:
@@ -208,6 +209,12 @@ def _check_guard(spec: Spec, payload: dict, mode: Mode) -> None:
 
 
 def _build_request(spec: Spec, payload: dict) -> Any:
+    # Несущая проверка, а не документация невозможного: при spec.request is None
+    # _spec_keys падает в сигнатуру самого метода, поэтому строка REQ/ID_REQ без
+    # request-класса регистрируется штатно и взрывается только здесь, на вызове.
+    # Каталог проверяется целиком в test_every_req_shape_names_a_request_class;
+    # этот assert — второй рубеж, и под python -O его нет.
+    assert spec.request, spec.method
     cls = getattr(pyrus_requests, spec.request)
     try:
         return cls(**payload)
@@ -235,12 +242,34 @@ def _call_plain(client: PyrusAPI, spec: Spec, args: list, options: dict) -> Any:
 
 
 def _register(mcp: FastMCP, client: PyrusAPI, spec: Spec, mode: Mode, max_bytes: int) -> None:
-    """Одна строка таблицы → один инструмент MCP.
+    """Одна строка таблицы → один инструмент MCP. Форма подписи выбирается по
+    spec.shape и наличию ключей у request-класса.
 
-    Порядок в каждом замыкании обязателен: _check_offset и _check_guard идут
-    до вызова Pyrus. offset проверяется в _paginate уже после вызова, и для
-    пишущего инструмента это означало бы «запись состоялась, а модель получила
-    только претензию к своему аргументу».
+    Обновлять рисунок вместе с любой новой Shape: устаревший хуже отсутствующего.
+
+        Shape (ключи)      | подпись инструмента
+        -------------------+------------------------------------
+        PLAIN  (нет ключей)| tool(offset)
+        PLAIN              | tool(options, offset)
+        BY_ID  (нет ключей)| tool(entity_id, offset)
+        BY_ID              | tool(entity_id, options, offset)
+        REQ                | tool(request, offset)
+        ID_REQ (required)  | tool(entity_id, request, offset)
+        ID_REQ             | tool(entity_id, request?, offset)
+                             ^ offset есть у всех: пишущие тоже отдают списки
+                               (sync_catalog в dry-run, update_catalog_items)
+
+        вызов: args -> _check_offset -> _check_guard -> _build_request -> PyrusAPI
+                          | offset < 0     | mode != FULL                  |
+                          +-> ToolError    +-> ToolError                   v
+                          ^ оба до вызова: после него отказ означал бы
+                            «запись состоялась, а модель получила отказ»
+                                     _adapt -> _to_plain -> _paginate -> окно
+                                        | error_code                  + _pagination
+                                        +-> ToolError
+
+    ONE_OFF сюда не приходит: три ручных инструмента живут в
+    _register_one_offs.
     """
     method = getattr(client, spec.method)
     description = _describe(spec, mode)
@@ -250,13 +279,13 @@ def _register(mcp: FastMCP, client: PyrusAPI, spec: Spec, mode: Mode, max_bytes:
     match spec.shape:
         case Shape.PLAIN if not keys:
 
-            def tool(offset: int = 0) -> Any:
+            def tool(offset: int = 0) -> Any:  # pyright: ignore[reportRedeclaration]
                 _check_offset(offset)
                 return _adapt(method(), offset, max_bytes)
 
         case Shape.PLAIN:
 
-            def tool(options: dict | None = None, offset: int = 0) -> Any:  # type: ignore[misc]
+            def tool(options: dict | None = None, offset: int = 0) -> Any:  # pyright: ignore[reportRedeclaration]
                 _check_offset(offset)
                 payload = options or {}
                 _check_guard(spec, payload, mode)
@@ -264,13 +293,13 @@ def _register(mcp: FastMCP, client: PyrusAPI, spec: Spec, mode: Mode, max_bytes:
 
         case Shape.BY_ID if not keys:
 
-            def tool(entity_id: int, offset: int = 0) -> Any:  # type: ignore[misc]
+            def tool(entity_id: int, offset: int = 0) -> Any:  # pyright: ignore[reportRedeclaration]
                 _check_offset(offset)
                 return _adapt(method(entity_id), offset, max_bytes)
 
         case Shape.BY_ID:
 
-            def tool(entity_id: int, options: dict | None = None, offset: int = 0) -> Any:  # type: ignore[misc]
+            def tool(entity_id: int, options: dict | None = None, offset: int = 0) -> Any:  # pyright: ignore[reportRedeclaration]
                 _check_offset(offset)
                 payload = options or {}
                 _check_guard(spec, payload, mode)
@@ -280,7 +309,7 @@ def _register(mcp: FastMCP, client: PyrusAPI, spec: Spec, mode: Mode, max_bytes:
 
         case Shape.REQ:
 
-            def tool(request: dict, offset: int = 0) -> Any:  # type: ignore[misc]
+            def tool(request: dict, offset: int = 0) -> Any:  # pyright: ignore[reportRedeclaration]
                 _check_offset(offset)
                 _check_guard(spec, request, mode)
                 return _adapt(method(_build_request(spec, request)), offset, max_bytes)
@@ -289,14 +318,14 @@ def _register(mcp: FastMCP, client: PyrusAPI, spec: Spec, mode: Mode, max_bytes:
         # параметр request обязателен и в сигнатуре инструмента.
         case Shape.ID_REQ if required:
 
-            def tool(entity_id: int, request: dict, offset: int = 0) -> Any:  # type: ignore[misc]
+            def tool(entity_id: int, request: dict, offset: int = 0) -> Any:  # pyright: ignore[reportRedeclaration]
                 _check_offset(offset)
                 _check_guard(spec, request, mode)
                 return _adapt(method(entity_id, _build_request(spec, request)), offset, max_bytes)
 
         case Shape.ID_REQ:
 
-            def tool(entity_id: int, request: dict | None = None, offset: int = 0) -> Any:  # type: ignore[misc]
+            def tool(entity_id: int, request: dict | None = None, offset: int = 0) -> Any:  # pyright: ignore[reportRedeclaration]
                 _check_offset(offset)
                 payload = request or {}
                 _check_guard(spec, payload, mode)
@@ -319,7 +348,9 @@ def _register_one_offs(
         def download_file(file_id: int) -> dict:
             """Скачать вложение и вернуть его содержимое инлайн. На диск ничего
             не пишется. Текст возвращается как есть, бинарные данные — base64."""
-            result = client.download_file(file_id)
+            # BaseResponse не объявляет raw_file/filename — их приносит
+            # DownloadResponse, и то как = None.
+            result: Any = client.download_file(file_id)
             if code := getattr(result, "error_code", None):
                 raise ToolError(f"Pyrus вернул ошибку {code}")
             raw: bytes = result.raw_file
@@ -398,11 +429,15 @@ def _make_client(**kwargs: Any) -> PyrusAPI:
     return PyrusAPI(**kwargs)
 
 
-def _die(message: str) -> None:
+def _die(message: str) -> NoReturn:
     print(f"pyrus-mcp: {message}", file=sys.stderr)
     raise SystemExit(2)
 
 
+@overload
+def _int_env(name: str, default: int, *, positive: bool = False) -> int: ...
+@overload
+def _int_env(name: str, default: None = None, *, positive: bool = False) -> int | None: ...
 def _int_env(name: str, default: int | None = None, *, positive: bool = False) -> int | None:
     """Числовая переменная окружения. Мусор в ней — такая же ошибка конфигурации,
     как отсутствующий логин, и должна выходить так же, а не трейсбеком."""
@@ -413,7 +448,6 @@ def _int_env(name: str, default: int | None = None, *, positive: bool = False) -
         value = int(raw)
     except ValueError:
         _die(f"{name} должен быть целым числом, получено {raw!r}")
-        raise  # pragma: no cover
     if positive and value <= 0:
         _die(f"{name} должен быть положительным, получено {value}")
     return value
@@ -428,7 +462,6 @@ def resolve_mode(argv: list[str] | None = None) -> Mode:
         return Mode(raw)
     except ValueError:
         _die(f"неизвестный режим {raw!r}. Допустимые: {', '.join(m.value for m in Mode)}")
-        raise  # pragma: no cover
 
 
 def main(argv: list[str] | None = None) -> None:

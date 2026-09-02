@@ -16,7 +16,7 @@ license-files = ["LICENSE.md"]
 pyrus-mcp = "pyrus_mcp.server:main"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pyright>=1.1.411", "pre-commit"]
 
 [build-system]
 requires = ["hatchling"]
@@ -28,3 +28,11 @@ packages = ["src/pyrus_mcp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["error"]
+
+[tool.pyright]
+include = ["src", "tests"]
+# strict дал бы 322 ошибки: у pyrus-api и jsonpickle нет типов, почти всё —
+# reportUnknown*. Это шум, а не проверка.
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
