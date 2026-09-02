@@ -109,13 +109,20 @@ def _longest_list_key(data: Any) -> str | None:
     return max(lists)[1] if lists else None
 
 
+def _check_offset(offset: int) -> None:
+    """Единственная проверка offset, которую можно сделать до вызова Pyrus.
+    Зовётся дважды: из инструмента — до диспетча, из _paginate — как инвариант
+    самой пагинации, потому что _adapt зовут и напрямую."""
+    # Отрицательное значение молча отдало бы хвост списка под видом окна
+    # с начала, а next_offset отправил бы модель на второй проход.
+    if offset < 0:
+        raise ToolError(f"offset не может быть отрицательным, получено {offset}.")
+
+
 def _paginate(data: Any, offset: int, max_bytes: int) -> Any:
     """Режет самый длинный список верхнего уровня так, чтобы результат влез в
     лимит. Никогда не усекает молча: окно всегда подписано total и next_offset."""
-    # offset приходит от модели. Отрицательное значение молча отдало бы хвост
-    # списка под видом окна с начала, поэтому отклоняется явно.
-    if offset < 0:
-        raise ToolError(f"offset не может быть отрицательным, получено {offset}.")
+    _check_offset(offset)
 
     size = _encoded_size(data)
     if offset == 0 and size <= max_bytes:
@@ -123,16 +130,28 @@ def _paginate(data: Any, offset: int, max_bytes: int) -> Any:
 
     key = _longest_list_key(data)
     if key is None:
-        if offset:
+        if size > max_bytes:
             raise ToolError(
-                "В ответе нет списка верхнего уровня, поэтому offset к нему неприменим. "
-                "Повторите вызов с offset=0."
+                f"Результат {size} байт превышает лимит {max_bytes} и не содержит "
+                "списка, который можно нарезать. Сузьте запрос фильтрами или поднимите "
+                "PYRUS_MCP_MAX_RESULT_BYTES."
             )
-        raise ToolError(
-            f"Результат {size} байт превышает лимит {max_bytes} и не содержит "
-            "списка, который можно нарезать. Сузьте запрос фильтрами или поднимите "
-            "PYRUS_MCP_MAX_RESULT_BYTES."
-        )
+        # Сюда попадают только с offset != 0, и вызов уже состоялся. Если он был
+        # пишущим, выбросить его результат ради претензии к аргументу — значит
+        # потерять id созданной записи; прежний текст «повторите с offset=0»
+        # прямо приказывал модели повторить незаидемпотентную запись.
+        return {
+            **data,
+            "_pagination": {
+                "field": None,
+                "offset": offset,
+                "returned": None,
+                "total": None,
+                "next_offset": None,
+                "note": "В ответе нет списка верхнего уровня, offset неприменим. "
+                "Вызов выполнен, результат возвращён целиком; повторять его не нужно.",
+            },
+        }
 
     items = data[key]
     total = len(items)
@@ -216,6 +235,13 @@ def _call_plain(client: PyrusAPI, spec: Spec, args: list, options: dict) -> Any:
 
 
 def _register(mcp: FastMCP, client: PyrusAPI, spec: Spec, mode: Mode, max_bytes: int) -> None:
+    """Одна строка таблицы → один инструмент MCP.
+
+    Порядок в каждом замыкании обязателен: _check_offset и _check_guard идут
+    до вызова Pyrus. offset проверяется в _paginate уже после вызова, и для
+    пишущего инструмента это означало бы «запись состоялась, а модель получила
+    только претензию к своему аргументу».
+    """
     method = getattr(client, spec.method)
     description = _describe(spec, mode)
 
@@ -225,11 +251,13 @@ def _register(mcp: FastMCP, client: PyrusAPI, spec: Spec, mode: Mode, max_bytes:
         case Shape.PLAIN if not keys:
 
             def tool(offset: int = 0) -> Any:
+                _check_offset(offset)
                 return _adapt(method(), offset, max_bytes)
 
         case Shape.PLAIN:
 
             def tool(options: dict | None = None, offset: int = 0) -> Any:  # type: ignore[misc]
+                _check_offset(offset)
                 payload = options or {}
                 _check_guard(spec, payload, mode)
                 return _adapt(_call_plain(client, spec, [], payload), offset, max_bytes)
@@ -237,11 +265,13 @@ def _register(mcp: FastMCP, client: PyrusAPI, spec: Spec, mode: Mode, max_bytes:
         case Shape.BY_ID if not keys:
 
             def tool(entity_id: int, offset: int = 0) -> Any:  # type: ignore[misc]
+                _check_offset(offset)
                 return _adapt(method(entity_id), offset, max_bytes)
 
         case Shape.BY_ID:
 
             def tool(entity_id: int, options: dict | None = None, offset: int = 0) -> Any:  # type: ignore[misc]
+                _check_offset(offset)
                 payload = options or {}
                 _check_guard(spec, payload, mode)
                 return _adapt(
@@ -251,6 +281,7 @@ def _register(mcp: FastMCP, client: PyrusAPI, spec: Spec, mode: Mode, max_bytes:
         case Shape.REQ:
 
             def tool(request: dict, offset: int = 0) -> Any:  # type: ignore[misc]
+                _check_offset(offset)
                 _check_guard(spec, request, mode)
                 return _adapt(method(_build_request(spec, request)), offset, max_bytes)
 
@@ -259,12 +290,14 @@ def _register(mcp: FastMCP, client: PyrusAPI, spec: Spec, mode: Mode, max_bytes:
         case Shape.ID_REQ if required:
 
             def tool(entity_id: int, request: dict, offset: int = 0) -> Any:  # type: ignore[misc]
+                _check_offset(offset)
                 _check_guard(spec, request, mode)
                 return _adapt(method(entity_id, _build_request(spec, request)), offset, max_bytes)
 
         case Shape.ID_REQ:
 
             def tool(entity_id: int, request: dict | None = None, offset: int = 0) -> Any:  # type: ignore[misc]
+                _check_offset(offset)
                 payload = request or {}
                 _check_guard(spec, payload, mode)
                 return _adapt(method(entity_id, _build_request(spec, payload)), offset, max_bytes)

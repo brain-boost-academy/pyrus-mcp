@@ -883,7 +883,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastmcp", specifier = ">=4.0.1,<5" },
-    { name = "jsonpickle" },
+    { name = "jsonpickle", specifier = "<5" },
     { name = "pyrus-api", specifier = "==2.48.0" },
 ]
 
