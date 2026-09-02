@@ -144,11 +144,21 @@ def test_negative_offset_is_rejected_not_silently_windowed():
         server._adapt(FakeResponse(payload), -5, 1_000_000)
 
 
-def test_offset_on_a_listless_response_does_not_blame_the_size_limit():
-    """get_task возвращает {"task": {...}} без списка. Модель, пришедшая туда
-    с offset, не должна получить совет поднять PYRUS_MCP_MAX_RESULT_BYTES."""
-    with pytest.raises(ToolError, match="offset к нему неприменим"):
-        server._adapt(FakeResponse({"task": {"id": 1}}), 5, 1_000_000)
+def test_offset_on_a_listless_response_returns_the_result_not_a_retry_order():
+    """get_task возвращает {"task": {...}} без списка. Прежний текст ошибки
+    приказывал «повторите вызов с offset=0», и на пишущем инструменте это был
+    приказ повторить незаидемпотентную запись. Результат отдаётся с пометкой."""
+    out = server._adapt(FakeResponse({"task": {"id": 1}}), 5, 1_000_000)
+    assert out["task"] == {"id": 1}
+    assert out["_pagination"]["field"] is None
+    assert out["_pagination"]["offset"] == 5
+    assert "повторять его не нужно" in out["_pagination"]["note"]
+
+
+def test_listless_response_over_the_limit_still_blames_the_size():
+    """Пометкой тут не отделаться: отдать нечего, ответ не влезает."""
+    with pytest.raises(ToolError, match="не содержит"):
+        server._adapt(FakeResponse({"blob": "x" * 5000}), 5, 1024)
 
 
 def test_offset_past_the_end_keeps_the_pagination_contract():
@@ -357,14 +367,81 @@ def test_full_mode_lets_the_guarded_field_through():
     assert client.calls[0][0] == "update_catalog_items"
 
 
-def test_offset_is_hidden_on_writing_tools():
+def test_offset_is_offered_everywhere_including_writing_tools():
+    """Пишущие инструменты тоже отдают списки: sync_catalog в non-destructive
+    живёт только как dry-run «верни весь дифф», и без offset второе окно
+    диффа недостижимо. Проверка required ловит и схлопывание схемы целиком."""
+
     async def go():
         async with Client(_build(FakeClient(), Mode.FULL)) as c:
-            return {t.name: t.inputSchema.get("properties", {}) for t in await c.list_tools()}
+            return {t.name: t.input_schema for t in await c.list_tools()}
 
-    props = asyncio.run(go())
+    schemas = asyncio.run(go())
+    props = {n: s.get("properties", {}) for n, s in schemas.items()}
     assert "offset" in props["get_registry"]
-    assert "offset" not in props["create_task"]
+    assert "offset" in props["sync_catalog"]
+    assert set(props["create_task"]) == {"request", "offset"}
+    assert schemas["create_task"].get("required") == ["request"]
+
+
+def test_offset_reaches_pagination_through_the_tool():
+    """Единственное непроверенное звено offset-контракта: провода от параметра
+    инструмента до _adapt. Остальные проверки зовут _adapt/_paginate напрямую."""
+    payload = {"tasks": [{"id": i} for i in range(10)]}
+    out = _call(
+        _build(FakeClient(result=FakeResponse(payload)), Mode.READ_ONLY),
+        "get_forms",
+        {"offset": 5},
+    )
+    assert out.data["_pagination"] == {
+        "field": "tasks",
+        "offset": 5,
+        "returned": 5,
+        "total": 10,
+        "next_offset": None,
+    }
+
+
+def test_offset_reaches_pagination_through_a_writing_tool():
+    """Каждая из семи ветвей match протаскивает offset в _adapt отдельно.
+    Проверка на PLAIN покрывает одну; здесь ID_REQ — та самая форма, ради
+    диффа которой offset и оставлен видимым у пишущих инструментов."""
+    payload = {"items": [{"id": i} for i in range(10)]}
+    out = _call(
+        _build(FakeClient(result=FakeResponse(payload)), Mode.NON_DESTRUCTIVE),
+        "sync_catalog",
+        {"entity_id": 1, "request": {"apply": False}, "offset": 5},
+    )
+    assert out.data["_pagination"]["offset"] == 5
+    assert out.data["_pagination"]["returned"] == 5
+
+
+def test_negative_offset_is_refused_before_the_write_happens():
+    """Раньше method() уходил в Pyrus, и только потом _paginate смотрел на
+    offset: задача создавалась, её id выбрасывался, модель получала претензию
+    к своему аргументу. Проверка порядка, а не текста ошибки."""
+    client = FakeClient(result=FakeResponse({"task": {"id": 42}}))
+    with pytest.raises(ToolError, match="отрицательным"):
+        _call(
+            _build(client, Mode.NON_DESTRUCTIVE),
+            "create_task",
+            {"request": {"text": "x"}, "offset": -1},
+        )
+    assert client.calls == []
+
+
+def test_positive_offset_on_a_write_does_not_order_a_second_write():
+    """create_task отвечает без списка верхнего уровня. Модель обязана получить
+    id созданной задачи, а не приказ повторить вызов."""
+    client = FakeClient(result=FakeResponse({"task": {"id": 42}}))
+    out = _call(
+        _build(client, Mode.NON_DESTRUCTIVE),
+        "create_task",
+        {"request": {"text": "x"}, "offset": 5},
+    )
+    assert out.data["task"] == {"id": 42}
+    assert out.data["_pagination"]["field"] is None
+    assert [c[0] for c in client.calls] == ["create_task"]
 
 
 # --- download_file: инлайн, без записи на диск -----------------------------
