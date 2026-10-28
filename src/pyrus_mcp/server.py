@@ -12,17 +12,19 @@ import json
 import os
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NoReturn, overload
 
 import jsonpickle
+import requests
 import pyrus.models.entities as entities
 import pyrus.models.requests as pyrus_requests
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pyrus.client import PyrusAPI
 
-from .catalog import CATALOG, Mode, Shape, Spec, visible
+from .catalog import CATALOG, Level, Mode, Shape, Spec, visible
 
 DEFAULT_MAX_RESULT_BYTES = 256 * 1024
 
@@ -60,13 +62,34 @@ def _keys(func: Any, skip_first_positional: bool = False) -> tuple[list[str], li
 
 def _spec_keys(spec: Spec) -> tuple[list[str], list[str]]:
     if spec.request:
-        return _keys(getattr(pyrus_requests, spec.request).__init__)
+        keys, required = _keys(getattr(pyrus_requests, spec.request).__init__)
+        return keys + list(spec.extra_keys), required
     return _keys(getattr(PyrusAPI, spec.method), skip_first_positional=spec.shape is Shape.BY_ID)
 
 
+# Разметка упоминания официально не описана: снята с живых комментариев
+# через get_task. Плоский text упоминание не создаёт, в нём остаётся только имя.
+_FORMATTED_TEXT_HINT = (
+    "Форматирование и упоминания задаются только через formatted_text (HTML; размечаются "
+    "только перечисленные теги). Передавайте formatted_text; text для комментариев не нужен; "
+    "если Pyrus отклонит сочетание полей, ошибка вернётся целиком. "
+    'Теги: <b> <i> <s> <code> <q> <br>, <div data-type="heading">, '
+    '<mark data-color="red|yellow|green|blue">, <ul>/<ol><li>, <a href>. '
+    "Перевод строки — <br>; символы & < > в тексте экранируйте как &amp; &lt; &gt;. "
+    'Упоминание: <span data-personid="ID" data-type="user-mention">Имя</span>, '
+    "ID из get_contacts / get_members. Pyrus возвращает распознанные упоминания в поле "
+    "mentions комментария в ответе этого же вызова, повторный вызов не нужен. "
+    "Если ответ не влез в лимит, вместо него придёт _receipt: id задачи или объявления "
+    "и id + mentions последнего комментария (не обязательно вашего: например, при "
+    "edit_comment_id у comment_task). "
+    "Запись при этом уже выполнена: не повторяйте вызов."
+)
+
+
 def _describe(spec: Spec, mode: Mode) -> str:
-    """Описание инструмента. Ключи payload не хардкодятся — они снимаются с
-    upstream на импорте, поэтому обновление pyrus-api не рассинхронизирует их."""
+    """Описание инструмента. Ключи payload снимаются с upstream на импорте,
+    поэтому обновление pyrus-api не рассинхронизирует их. Исключение —
+    Spec.extra_keys: они заданы руками, дрейф ловит тест в test_catalog.py."""
     doc = re.split(
         r"\n\s*(?:Args|Returns):", inspect.getdoc(getattr(PyrusAPI, spec.method)) or ""
     )[0].strip()
@@ -81,6 +104,8 @@ def _describe(spec: Spec, mode: Mode) -> str:
             parts.append("Незнакомые ключи молча игнорируются Pyrus, а не отклоняются.")
     elif spec.request:
         parts.append(f"Ключи {field} не валидируются: upstream принимает произвольные kwargs.")
+    if "formatted_text" in spec.extra_keys:
+        parts.append(_FORMATTED_TEXT_HINT)
     if spec.guard and mode is not Mode.FULL:
         parts.append(f"Режим {mode}: часть полей заблокирована, вызов вернёт ошибку с названием поля.")
     return " ".join(parts)
@@ -110,19 +135,83 @@ def _longest_list_key(data: Any) -> str | None:
     return max(lists)[1] if lists else None
 
 
-def _check_offset(offset: int) -> None:
-    """Единственная проверка offset, которую можно сделать до вызова Pyrus.
-    Зовётся дважды: из инструмента — до диспетча, из _paginate — как инвариант
-    самой пагинации, потому что _adapt зовут и напрямую."""
+def _check_offset(offset: int, *, write: bool = False) -> None:
+    """Проверки offset, которые можно сделать до вызова Pyrus. Зовётся дважды:
+    из инструмента — до диспетча, из _paginate — как инвариант самой
+    пагинации, потому что _adapt зовут и напрямую. Там запись уже состоялась,
+    поэтому _paginate проверяет только знак."""
     # Отрицательное значение молча отдало бы хвост списка под видом окна
     # с начала, а next_offset отправил бы модель на второй проход.
     if offset < 0:
         raise ToolError(f"offset не может быть отрицательным, получено {offset}.")
+    # Окно пишущего вызова со сдвигом — это вторая запись ради того же ответа:
+    # второй комментарий или второй справочник.
+    if write and offset != 0:
+        raise ToolError(
+            f"offset у пишущего вызова неприменим, получено {offset}: следующее окно "
+            "означало бы повторную запись. Вызовите без offset."
+        )
 
 
-def _paginate(data: Any, offset: int, max_bytes: int) -> Any:
+def _writes(spec: Spec, payload: dict) -> bool:
+    """Меняет ли вызов данные. Уровень спека этого не решает: dry-run
+    sync_catalog живёт на WRITE, но ничего не пишет."""
+    return spec.level is not Level.READ and not (spec.dry_run and spec.dry_run(payload))
+
+
+def _write_receipt(data: Any) -> dict:
+    """Что модели нужно знать о состоявшейся записи, если весь ответ не влез:
+    id задачи или объявления и id + mentions последнего комментария. Без этого
+    обещание подсказки «mentions в ответе этого же вызова» ложно ровно на
+    больших задачах. Что новый комментарий в ответе последний, вживую не
+    проверялось, поэтому ключ называется last_comment, а не new_comment."""
+    receipt: dict = {}
+    if not isinstance(data, dict):
+        return receipt
+    # upload_file отвечает guid на верхнем уровне, и без него файл не прикрепить.
+    # *_id — на случай ответа с идентификатором под своим именем (catalog_id):
+    # квитанция без id после «не повторяйте вызов» теряет созданную запись.
+    for key, value in data.items():
+        if (key in ("id", "guid") or key.endswith("_id")) and isinstance(value, (int, str)):
+            receipt[key] = value
+    for entity in ("task", "announcement"):
+        obj = data.get(entity)
+        if not isinstance(obj, dict) or "id" not in obj:
+            continue
+        receipt[f"{entity}_id"] = obj["id"]
+        comments = obj.get("comments")
+        if isinstance(comments, list) and comments and isinstance(comments[-1], dict):
+            last = comments[-1]
+            receipt["last_comment"] = {k: last[k] for k in ("id", "mentions") if k in last}
+    return receipt
+
+
+def _receipt_result(data: Any, offset: int, size: int, max_bytes: int) -> dict:
+    """Ответ пишущего вызова, который в лимит не влез. Ошибка (isError) или
+    ответ больше лимита читались бы клиентом или моделью как «не получилось»
+    и вели к дублю записи, поэтому отдаётся результат: квитанция вместо ответа."""
+    return {
+        "_receipt": _write_receipt(data),
+        "_pagination": {
+            "field": None,
+            "offset": offset,
+            "returned": None,
+            "total": None,
+            "next_offset": None,
+            "note": "Вызов выполнен, изменение уже применено; не повторяйте вызов. "
+            f"Ответ {size} байт не влез в лимит {max_bytes}, и нарезать его так, чтобы "
+            "влез, нельзя, поэтому вместо него — _receipt. Чтобы видеть такие ответы "
+            "целиком, поднимите PYRUS_MCP_MAX_RESULT_BYTES.",
+        },
+    }
+
+
+def _paginate(data: Any, offset: int, max_bytes: int, *, write: bool = False) -> Any:
     """Режет самый длинный список верхнего уровня так, чтобы результат влез в
-    лимит. Никогда не усекает молча: окно всегда подписано total и next_offset."""
+    лимит. Никогда не усекает молча: окно всегда подписано total и next_offset.
+    У пишущего вызова (write) продолжения нет: next_offset всегда None, а
+    остаток назван в note. Если ответ записи не нарезать в лимит, вместо него
+    отдаётся _receipt (_receipt_result)."""
     _check_offset(offset)
 
     size = _encoded_size(data)
@@ -132,6 +221,10 @@ def _paginate(data: Any, offset: int, max_bytes: int) -> Any:
     key = _longest_list_key(data)
     if key is None:
         if size > max_bytes:
+            # Пишущий вызов уже состоялся: comment_task на большой задаче
+            # отвечает всей задачей без списка верхнего уровня.
+            if write:
+                return _receipt_result(data, offset, size, max_bytes)
             raise ToolError(
                 f"Результат {size} байт превышает лимит {max_bytes} и не содержит "
                 "списка, который можно нарезать. Сузьте запрос фильтрами или поднимите "
@@ -157,7 +250,7 @@ def _paginate(data: Any, offset: int, max_bytes: int) -> Any:
     items = data[key]
     total = len(items)
     if offset >= total:
-        return {
+        out = {
             **data,
             key: [],
             "_pagination": {
@@ -168,31 +261,71 @@ def _paginate(data: Any, offset: int, max_bytes: int) -> Any:
                 "next_offset": None,
             },
         }
+        # Самый длинный список пуст, а вес лежит рядом с ним (тело статьи у
+        # create_knowledge_base_entity): резать нечего.
+        if write and _encoded_size(out) > max_bytes:
+            return _receipt_result(data, offset, size, max_bytes)
+        return out
 
     count = total - offset
     while True:
         window = items[offset : offset + count]
-        out = {
-            **data,
-            key: window,
-            "_pagination": {
-                "field": key,
-                "offset": offset,
-                "returned": len(window),
-                "total": total,
-                "next_offset": offset + len(window) if offset + len(window) < total else None,
-            },
+        more = offset + len(window) < total
+        page: dict = {
+            "field": key,
+            "offset": offset,
+            "returned": len(window),
+            "total": total,
+            "next_offset": offset + len(window) if more and not write else None,
         }
+        # Следующее окно пишущего вызова — это повтор записи (второй справочник
+        # у create_catalog), поэтому продолжения нет, а остаток честно назван.
+        # Читающий инструмент его не заменяет: дифф update_catalog_items есть
+        # только в этом ответе, а get_catalog отдаёт текущее состояние.
+        # Пометка ставится до замера: она тоже занимает место в лимите.
+        if write and more:
+            page["note"] = (
+                "Вызов выполнен, изменение уже применено; не повторяйте вызов: у пишущего "
+                f"инструмента следующее окно — это повторная запись. Показаны {len(window)} "
+                f"из {total} элементов {key}, остальные элементы этого ответа недоступны. "
+                "Целиком такие ответы видны при большем PYRUS_MCP_MAX_RESULT_BYTES; текущее "
+                "состояние данных отдают читающие инструменты."
+            )
+        out = {**data, key: window, "_pagination": page}
         if _encoded_size(out) <= max_bytes or count <= 1:
-            return out
+            break
         count //= 2
+    # Окно в один элемент может не влезть, если вес вне списка. Для чтения это
+    # открытый TODO; запись повторять нельзя, поэтому — квитанция.
+    if write and _encoded_size(out) > max_bytes:
+        return _receipt_result(data, offset, size, max_bytes)
+    return out
 
 
-def _adapt(result: Any, offset: int, max_bytes: int) -> Any:
+def _dispatch(call: Callable[[], Any], write: bool) -> Any:
+    """Вызов Pyrus. У пишущего вызова сетевая ошибка или ответ, который не
+    разобрался как JSON (502-страница), не значат, что записи не было: обычная
+    ошибка читалась бы как «не получилось» и вела к дублю, поэтому модель
+    получает «исход неизвестен». Прочие исключения pyrus-api бросает до
+    запроса (тип entity_id, размер файла): записи точно не было, и они
+    уходят как есть. Зависший запрос сюда не доходит: таймаута у upstream нет."""
+    if not write:
+        return call()
+    try:
+        return call()
+    except (requests.RequestException, ValueError) as exc:
+        raise ToolError(
+            f"Исход вызова неизвестен ({type(exc).__name__}): изменение могло уже "
+            "примениться. Прежде чем повторять, проверьте текущее состояние читающим "
+            "инструментом."
+        ) from exc
+
+
+def _adapt(result: Any, offset: int, max_bytes: int, *, write: bool = False) -> Any:
     code = getattr(result, "error_code", None)
     if code:
         raise ToolError(f"Pyrus вернул ошибку {code}: {getattr(result, 'error', '') or '—'}")
-    return _paginate(_to_plain(result), offset, max_bytes)
+    return _paginate(_to_plain(result), offset, max_bytes, write=write)
 
 
 # --- диспетчер -------------------------------------------------------------
@@ -216,8 +349,23 @@ def _build_request(spec: Spec, payload: dict) -> Any:
     # этот assert — второй рубеж, и под python -O его нет.
     assert spec.request, spec.method
     cls = getattr(pyrus_requests, spec.request)
+    base = {k: v for k, v in payload.items() if k not in spec.extra_keys}
+    # Не ставятся только None и пустая строка, как `if text:` в upstream.
+    # Прочие ложные значения уходят как есть: явный false у bpmn-ключа значим,
+    # а пустой список в formatted_text должен дойти до проверки типа ниже.
+    extra = {k: v for k, v in payload.items() if k in spec.extra_keys and v not in (None, "")}
+    if not isinstance(extra.get("formatted_text", ""), str):
+        raise ToolError(f"{spec.method}: formatted_text должен быть строкой с HTML.")
+    # Allowlist, как у guard'ов: строка "false" ушла бы в Pyrus как есть.
+    if not isinstance(extra.get("bpmn_resume_processing", False), bool):
+        raise ToolError(f"{spec.method}: bpmn_resume_processing должен быть true или false.")
+    node = extra.get("bpmn_node_id", "")
+    if isinstance(node, bool) or not isinstance(node, (str, int)):
+        raise ToolError(f"{spec.method}: bpmn_node_id должен быть строкой или числом.")
+    if not isinstance(extra.get("bpmn_token_moves", []), list):
+        raise ToolError(f"{spec.method}: bpmn_token_moves должен быть списком.")
     try:
-        return cls(**payload)
+        obj = cls(**base)
     except TypeError as exc:
         keys, required = _spec_keys(spec)
         raise ToolError(
@@ -225,6 +373,12 @@ def _build_request(spec: Spec, payload: dict) -> Any:
             f"Валидные ключи: {', '.join(sorted(keys)) or '—'}. "
             f"Обязательные: {', '.join(required) or 'нет'}."
         ) from exc
+    for key, value in extra.items():
+        setattr(obj, key, value)
+    for key in spec.keep_false:
+        if base.get(key) is False:
+            setattr(obj, key, False)
+    return obj
 
 
 def _call_plain(client: PyrusAPI, spec: Spec, args: list, options: dict) -> Any:
@@ -256,17 +410,23 @@ def _register(mcp: FastMCP, client: PyrusAPI, spec: Spec, mode: Mode, max_bytes:
         REQ                | tool(request, offset)
         ID_REQ (required)  | tool(entity_id, request, offset)
         ID_REQ             | tool(entity_id, request?, offset)
-                             ^ offset есть у всех: пишущие тоже отдают списки
-                               (sync_catalog в dry-run, update_catalog_items)
+                             ^ offset есть у всех, но у пишущего вызова
+                               (_writes) отклоняется любой, кроме 0; листать
+                               можно только чтение и dry-run sync_catalog
 
-        вызов: args -> _check_offset -> _check_guard -> _build_request -> PyrusAPI
-                          | offset < 0     | mode != FULL                  |
-                          +-> ToolError    +-> ToolError                   v
-                          ^ оба до вызова: после него отказ означал бы
-                            «запись состоялась, а модель получила отказ»
+        вызов: args -> _check_offset -> _check_guard -> _build_request -> _dispatch -> PyrusAPI
+                          | offset < 0,    | mode != FULL  | неверный ключ | сеть / не JSON
+                          | offset != 0 у  |               | или тип extra | у пишущего
+                          | пишущего       |               |               |
+                          +-> ToolError    +-> ToolError   +-> ToolError   +-> ToolError
+                          ^ первые три до вызова: после      (исход неизвестен)
+                            него отказ означал бы «запись    |
+                            состоялась, а модель получила    v
+                            отказ»
                                      _adapt -> _to_plain -> _paginate -> окно
-                                        | error_code                  + _pagination
-                                        +-> ToolError
+                                        | error_code              |   + _pagination
+                                        +-> ToolError             +-> _receipt (запись
+                                                                      не влезла в лимит)
 
     ONE_OFF сюда не приходит: три ручных инструмента живут в
     _register_one_offs.
@@ -276,60 +436,66 @@ def _register(mcp: FastMCP, client: PyrusAPI, spec: Spec, mode: Mode, max_bytes:
 
     keys, required = _spec_keys(spec)
 
+    def check(payload: dict, offset: int) -> bool:
+        """Всё, что отклоняется до вызова Pyrus. Возвращает, пишущий ли вызов."""
+        write = _writes(spec, payload)
+        _check_offset(offset, write=write)
+        _check_guard(spec, payload, mode)
+        return write
+
+    def adapt(call: Callable[[], Any], offset: int, write: bool) -> Any:
+        return _adapt(_dispatch(call, write), offset, max_bytes, write=write)
+
     match spec.shape:
         case Shape.PLAIN if not keys:
 
             def tool(offset: int = 0) -> Any:  # pyright: ignore[reportRedeclaration]
-                _check_offset(offset)
-                return _adapt(method(), offset, max_bytes)
+                write = check({}, offset)
+                return adapt(lambda: method(), offset, write)
 
         case Shape.PLAIN:
 
             def tool(options: dict | None = None, offset: int = 0) -> Any:  # pyright: ignore[reportRedeclaration]
-                _check_offset(offset)
                 payload = options or {}
-                _check_guard(spec, payload, mode)
-                return _adapt(_call_plain(client, spec, [], payload), offset, max_bytes)
+                write = check(payload, offset)
+                return adapt(lambda: _call_plain(client, spec, [], payload), offset, write)
 
         case Shape.BY_ID if not keys:
 
             def tool(entity_id: int, offset: int = 0) -> Any:  # pyright: ignore[reportRedeclaration]
-                _check_offset(offset)
-                return _adapt(method(entity_id), offset, max_bytes)
+                write = check({}, offset)
+                return adapt(lambda: method(entity_id), offset, write)
 
         case Shape.BY_ID:
 
             def tool(entity_id: int, options: dict | None = None, offset: int = 0) -> Any:  # pyright: ignore[reportRedeclaration]
-                _check_offset(offset)
                 payload = options or {}
-                _check_guard(spec, payload, mode)
-                return _adapt(
-                    _call_plain(client, spec, [entity_id], payload), offset, max_bytes
-                )
+                write = check(payload, offset)
+                return adapt(lambda: _call_plain(client, spec, [entity_id], payload), offset, write)
 
         case Shape.REQ:
 
             def tool(request: dict, offset: int = 0) -> Any:  # pyright: ignore[reportRedeclaration]
-                _check_offset(offset)
-                _check_guard(spec, request, mode)
-                return _adapt(method(_build_request(spec, request)), offset, max_bytes)
+                write = check(request, offset)
+                req = _build_request(spec, request)
+                return adapt(lambda: method(req), offset, write)
 
         # Схема не врёт: если у request-класса есть обязательные поля,
         # параметр request обязателен и в сигнатуре инструмента.
         case Shape.ID_REQ if required:
 
             def tool(entity_id: int, request: dict, offset: int = 0) -> Any:  # pyright: ignore[reportRedeclaration]
-                _check_offset(offset)
-                _check_guard(spec, request, mode)
-                return _adapt(method(entity_id, _build_request(spec, request)), offset, max_bytes)
+                write = check(request, offset)
+                req = _build_request(spec, request)
+                return adapt(lambda: method(entity_id, req), offset, write)
 
         case Shape.ID_REQ:
 
             def tool(entity_id: int, request: dict | None = None, offset: int = 0) -> Any:  # pyright: ignore[reportRedeclaration]
-                _check_offset(offset)
                 payload = request or {}
-                _check_guard(spec, payload, mode)
-                return _adapt(method(entity_id, _build_request(spec, payload)), offset, max_bytes)
+                write = check(payload, offset)
+                req = _build_request(spec, payload)
+                return adapt(lambda: method(entity_id, req), offset, write)
 
         case _:  # pragma: no cover — ONE_OFF регистрируется отдельно
             raise AssertionError(spec.shape)
@@ -384,7 +550,8 @@ def _register_one_offs(
                 )
             if not target.is_file():
                 raise ToolError(f"Файл не найден: {target}")
-            return _adapt(client.upload_file(str(target)), 0, max_bytes)
+            result = _dispatch(lambda: client.upload_file(str(target)), write=True)
+            return _adapt(result, 0, max_bytes, write=True)
 
         mcp.tool(upload_file)
 
@@ -393,9 +560,10 @@ def _register_one_offs(
         def set_avatar(member_id: int, file_guid: str, external_avatar_id: str | None = None) -> Any:
             """Назначить аватар пользователю. file_guid — идентификатор,
             полученный от upload_file, а не путь на диске."""
-            return _adapt(
-                client.set_avatar(member_id, file_guid, external_avatar_id), 0, max_bytes
+            result = _dispatch(
+                lambda: client.set_avatar(member_id, file_guid, external_avatar_id), write=True
             )
+            return _adapt(result, 0, max_bytes, write=True)
 
         mcp.tool(set_avatar)
 

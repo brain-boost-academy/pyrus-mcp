@@ -6,6 +6,7 @@ from dataclasses import replace
 from typing import cast
 
 import pytest
+import requests
 from conftest import FakeClient, FakeResponse
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
@@ -163,6 +164,249 @@ def test_listless_response_over_the_limit_still_blames_the_size():
         server._adapt(FakeResponse({"blob": "x" * 5000}), 5, 1024)
 
 
+def test_listless_write_over_the_limit_is_a_result_not_an_error():
+    """comment_task на большой задаче отвечает всей задачей без списка верхнего
+    уровня. Ошибка (isError) после состоявшейся записи читалась бы клиентом или
+    моделью как «не получилось» и вела к дублю, поэтому отдаётся результат."""
+    big = FakeResponse({"task": {"id": 1, "text": "x" * 5000}})
+    client = FakeClient(result=big)
+    out = _call(
+        _build(client, Mode.NON_DESTRUCTIVE, max_bytes=1024),
+        "comment_task",
+        {"entity_id": 1, "request": {"formatted_text": "<b>x</b>"}},
+    ).data
+    assert "Вызов выполнен, изменение уже применено" in out["_pagination"]["note"]
+    assert out["_pagination"]["next_offset"] is None
+    assert "task" not in out
+    assert [c[0] for c in client.calls] == ["comment_task"]
+
+
+def test_listless_write_over_the_limit_keeps_ids_and_mentions():
+    """Подсказка обещает mentions в ответе этого же вызова, а get_task по той же
+    задаче упрётся в тот же лимит: id и mentions должны выжить в _receipt."""
+    comments = [
+        {"id": 10, "text": "x" * 3000},
+        {"id": 11, "text": "y" * 3000, "mentions": [1318562]},
+    ]
+    client = FakeClient(result=FakeResponse({"task": {"id": 7, "comments": comments}}))
+    out = _call(
+        _build(client, Mode.NON_DESTRUCTIVE, max_bytes=1024),
+        "comment_task",
+        {"entity_id": 7, "request": {"formatted_text": "<b>x</b>"}},
+    ).data
+    assert out["_receipt"] == {"task_id": 7, "last_comment": {"id": 11, "mentions": [1318562]}}
+
+
+def test_listless_create_over_the_limit_keeps_the_new_id():
+    client = FakeClient(result=FakeResponse({"announcement": {"id": 5, "text": "x" * 5000}}))
+    out = _call(
+        _build(client, Mode.NON_DESTRUCTIVE, max_bytes=1024),
+        "create_announcement",
+        {"request": {"text": "x"}},
+    ).data
+    assert out["_receipt"] == {"announcement_id": 5}
+
+
+def test_receipt_keeps_a_top_level_id_under_its_own_name():
+    """Квитанция без id после «не повторяйте вызов» теряла бы созданную запись."""
+    data = {"catalog_id": 3, "blob": "x" * 5000}
+    out = server._adapt(FakeResponse(data), 0, 1024, write=True)
+    assert out["_receipt"] == {"catalog_id": 3}
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        # Самый длинный список пуст: ветка «offset за концом» отдавала всё целиком.
+        {"id": 5, "body": "x" * 5000, "attachments": []},
+        # Вес вне списка: окно в один элемент всё равно больше лимита.
+        {"id": 5, "body": "x" * 5000, "members": [{"i": i} for i in range(5)]},
+    ],
+)
+def test_write_whose_window_does_not_fit_gets_a_receipt(data):
+    """Ответ больше лимита клиент может отбросить, и модель повторит запись:
+    у пишущего вызова вместо него приходит квитанция."""
+    out = server._adapt(FakeResponse(data), 0, 1024, write=True)
+    assert out["_receipt"] == {"id": 5}
+    assert "не повторяйте" in out["_pagination"]["note"]
+    assert server._encoded_size(out) <= 1024
+
+
+def test_list_bearing_write_over_the_limit_offers_no_next_offset():
+    """next_offset у create_catalog — приглашение вызвать его снова, то есть
+    создать второй справочник. Окно отдаётся, но продолжения нет."""
+    items = [{"id": i, "v": "x" * 200} for i in range(20)]
+    client = FakeClient(result=FakeResponse({"catalog_id": 3, "items": items}))
+    out = _call(
+        _build(client, Mode.NON_DESTRUCTIVE, max_bytes=1024),
+        "create_catalog",
+        {"request": {"name": "n"}},
+    ).data
+    page = out["_pagination"]
+    assert page["returned"] < page["total"] == 20
+    assert page["next_offset"] is None
+    assert "не повторяйте" in page["note"]
+    assert out["catalog_id"] == 3
+    assert server._encoded_size(out) <= 1024
+    assert len(client.calls) == 1
+
+
+def test_sync_catalog_dry_run_pages_through_the_diff():
+    """Дифф dry-run дальше первого окна достижим только через offset, а повтор
+    dry-run ничего не пишет."""
+    items = [{"id": i, "v": "x" * 200} for i in range(20)]
+    mcp = _build(FakeClient(result=FakeResponse({"added": items})), Mode.NON_DESTRUCTIVE, max_bytes=1024)
+    first = _call(mcp, "sync_catalog", {"entity_id": 1, "request": {"apply": False}}).data
+    page = first["_pagination"]
+    assert page["next_offset"] is not None
+    assert "note" not in page
+    second = _call(
+        mcp, "sync_catalog", {"entity_id": 1, "request": {"apply": False}, "offset": page["next_offset"]}
+    ).data
+    assert second["_pagination"]["offset"] == page["next_offset"]
+
+
+def test_sync_catalog_apply_is_a_write_and_offers_no_next_offset():
+    """apply=true (только в full) повторно синхронизирует справочник, а между
+    вызовами он мог измениться: это не повторяемый вызов."""
+    items = [{"id": i, "v": "x" * 200} for i in range(20)]
+    client = FakeClient(result=FakeResponse({"added": items}))
+    mcp = _build(client, Mode.FULL, max_bytes=1024)
+    out = _call(mcp, "sync_catalog", {"entity_id": 1, "request": {"apply": True}}).data
+    assert out["_pagination"]["next_offset"] is None
+    assert "не повторяйте" in out["_pagination"]["note"]
+    with pytest.raises(ToolError, match="повторную запись"):
+        _call(mcp, "sync_catalog", {"entity_id": 1, "request": {"apply": True}, "offset": 3})
+    assert len(client.calls) == 1
+
+
+@pytest.mark.filterwarnings("ignore:keys will default to True:DeprecationWarning")
+def test_sync_catalog_dry_run_sends_apply_false():
+    """Upstream ставит apply только для true, и без обхода тело было бы пустым:
+    dry-run держался бы на неописанном умолчании Pyrus."""
+    client = FakeClient()
+    _call(
+        _build(client, Mode.NON_DESTRUCTIVE),
+        "sync_catalog",
+        {"entity_id": 1, "request": {"apply": False, "items": []}},
+    )
+    obj = client.calls[0][1][1]
+    assert json.loads(PyrusAPI().serialize_request(obj)) == {"apply": False}
+
+
+def test_update_catalog_items_note_does_not_promise_the_rest_of_the_diff():
+    """Дифф есть только в ответе записи: get_catalog отдаёт текущее состояние,
+    а не added/updated/deleted."""
+    items = [{"id": i, "v": "x" * 200} for i in range(20)]
+    out = _call(
+        _build(FakeClient(result=FakeResponse({"updated": items})), Mode.NON_DESTRUCTIVE, max_bytes=1024),
+        "update_catalog_items",
+        {"entity_id": 1, "request": {"upsert": []}},
+    ).data
+    note = out["_pagination"]["note"]
+    assert "недоступны" in note
+    assert "читающие инструменты" in note
+
+
+def test_listless_read_over_the_limit_still_says_narrow_the_query():
+    """Признак записи выводит _writes (Level и Spec.dry_run): чтение не должно его получить."""
+    client = FakeClient(result=FakeResponse({"task": {"id": 1, "text": "x" * 5000}}))
+    with pytest.raises(ToolError, match="Сузьте") as exc:
+        _call(_build(client, Mode.READ_ONLY, max_bytes=1024), "get_task", {"entity_id": 1})
+    assert "Вызов выполнен" not in str(exc.value)
+
+
+def test_upload_file_over_the_limit_says_the_write_already_happened(tmp_path):
+    """upload_file регистрируется руками, мимо _register: признак записи там ставится явно."""
+    (tmp_path / "ok.txt").write_text("x")
+    client = FakeClient(result=FakeResponse({"guid": "g1", "blob": "x" * 5000}))
+    out = _call(
+        _build(client, Mode.FULL, tmp_path.resolve(), max_bytes=1024),
+        "upload_file",
+        {"file_path": "ok.txt"},
+    ).data
+    assert "Вызов выполнен" in out["_pagination"]["note"]
+    assert out["_receipt"] == {"guid": "g1"}
+
+
+def test_set_avatar_over_the_limit_says_the_write_already_happened():
+    """set_avatar, как и upload_file, регистрируется мимо _register."""
+    client = FakeClient(result=FakeResponse({"id": 1, "blob": "x" * 5000}))
+    out = _call(
+        _build(client, Mode.FULL, max_bytes=1024),
+        "set_avatar",
+        {"member_id": 1, "file_guid": "g"},
+    ).data
+    assert "Вызов выполнен" in out["_pagination"]["note"]
+    assert out["_receipt"] == {"id": 1}
+    assert len(client.calls) == 1
+
+
+def test_destructive_tool_is_a_write_for_offset_and_receipt():
+    """DESTRUCTIVE — тоже запись: повтор удаления ради окна недопустим."""
+    client = FakeClient(result=FakeResponse({"id": 9, "blob": "x" * 5000}))
+    mcp = _build(client, Mode.FULL, max_bytes=1024)
+    with pytest.raises(ToolError, match="повторную запись"):
+        _call(mcp, "delete_knowledge_base_entity", {"entity_id": 9, "offset": 2})
+    assert client.calls == []
+    out = _call(mcp, "delete_knowledge_base_entity", {"entity_id": 9}).data
+    assert out["_receipt"] == {"id": 9}
+    assert len(client.calls) == 1
+
+
+class _Raising(FakeClient):
+    """Вызов падает с заданным исключением вместо ответа."""
+
+    def __init__(self, exc):
+        super().__init__()
+        self.exc = exc
+
+    def __getattr__(self, name):
+        def call(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            raise self.exc
+
+        return call
+
+
+def _DroppedConnection():
+    """Pyrus мог успеть записать, а ответ до клиента не дошёл."""
+    return _Raising(requests.ConnectionError("connection reset"))
+
+
+def test_write_that_raises_says_the_outcome_is_unknown():
+    """Обычная ошибка после отправленного POST читается как «не получилось»
+    и ведёт к дублю: модель должна сначала проверить состояние чтением."""
+    client = _DroppedConnection()
+    with pytest.raises(ToolError, match="Исход вызова неизвестен"):
+        _call(
+            _build(client, Mode.NON_DESTRUCTIVE),
+            "comment_task",
+            {"entity_id": 1, "request": {"formatted_text": "<b>x</b>"}},
+        )
+    assert len(client.calls) == 1
+
+
+def test_write_refused_before_sending_is_not_an_unknown_outcome():
+    """pyrus-api проверяет аргументы до запроса (тип entity_id, размер файла):
+    записи точно не было, и «проверьте состояние» отправило бы модель в никуда."""
+    client = _Raising(TypeError("entity_id must be an instance of str"))
+    with pytest.raises(ToolError) as exc:
+        _call(
+            _build(client, Mode.NON_DESTRUCTIVE),
+            "comment_task",
+            {"entity_id": 1, "request": {"formatted_text": "<b>x</b>"}},
+        )
+    assert "Исход вызова неизвестен" not in str(exc.value)
+
+
+def test_read_that_raises_does_not_claim_a_write():
+    client = _DroppedConnection()
+    with pytest.raises(ToolError) as exc:
+        _call(_build(client, Mode.READ_ONLY), "get_task", {"entity_id": 1})
+    assert "Исход вызова неизвестен" not in str(exc.value)
+
+
 def test_offset_past_the_end_keeps_the_pagination_contract():
     payload = {"tasks": [{"id": i} for i in range(10)]}
     page = server._adapt(FakeResponse(payload), 99, 1_000_000)["_pagination"]
@@ -181,6 +425,109 @@ def test_unknown_request_key_gives_valid_keys_not_a_bare_typeerror():
     with pytest.raises(ToolError) as exc:
         server._build_request(_spec("create_task"), {"txet": "опечатка"})
     assert "text" in str(exc.value) and "subject" in str(exc.value)
+    assert "formatted_text" in str(exc.value)
+
+
+_FT = '<b>жирный</b><br><span data-personid="1" data-type="user-mention">Имя</span>'
+
+
+# pyrus-api зовёт jsonpickle.encode без keys=, а jsonpickle 4 на это
+# предупреждает. Фильтр терпит предупреждение, но не требует его: pytest.warns
+# упал бы с DID NOT WARN, как только upstream передаст keys= сам.
+@pytest.mark.filterwarnings("ignore:keys will default to True:DeprecationWarning")
+@pytest.mark.parametrize(
+    "method", ["create_task", "comment_task", "create_announcement", "comment_announcement"]
+)
+def test_formatted_text_reaches_the_request_body(method):
+    """Upstream-классы formatted_text не знают: ключ ставится после конструктора
+    и должен доехать до тела запроса тем же serialize_request, что в production."""
+    obj = server._build_request(_spec(method), {"formatted_text": _FT})
+    assert vars(obj)["formatted_text"] == _FT
+    body = json.loads(PyrusAPI().serialize_request(obj))
+    assert body["formatted_text"] == _FT
+
+
+@pytest.mark.parametrize("empty", ["", None])
+def test_empty_formatted_text_is_not_set(empty):
+    obj = server._build_request(_spec("comment_task"), {"text": "ок", "formatted_text": empty})
+    assert obj.text == "ок"
+    assert "formatted_text" not in vars(obj)
+
+
+def test_bpmn_keys_of_a_comment_reach_the_request_object():
+    payload = {
+        "bpmn_node_id": "node-1",
+        "bpmn_resume_processing": True,
+        "bpmn_token_moves": [{"from": "a", "to": "b"}],
+    }
+    obj = server._build_request(_spec("comment_task"), payload)
+    assert {k: vars(obj)[k] for k in payload} == payload
+
+
+def test_explicit_false_bpmn_value_is_sent_not_dropped():
+    """Значение по умолчанию у Pyrus неизвестно, поэтому явный false уходит как есть."""
+    payload = {"bpmn_resume_processing": False, "bpmn_token_moves": []}
+    obj = server._build_request(_spec("comment_task"), payload)
+    assert {k: vars(obj)[k] for k in payload} == payload
+
+
+def test_non_bool_bpmn_resume_processing_is_refused_before_the_write():
+    """Строка "false" ушла бы в Pyrus как есть; как он её прочтёт, неизвестно."""
+    client = FakeClient()
+    with pytest.raises(ToolError, match="bpmn_resume_processing"):
+        _call(
+            _build(client, Mode.NON_DESTRUCTIVE),
+            "comment_task",
+            {"entity_id": 1, "request": {"bpmn_resume_processing": "false"}},
+        )
+    assert client.calls == []
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("bpmn_node_id", {"id": 1}),
+        ("bpmn_node_id", True),
+        ("bpmn_token_moves", "a->b"),
+        ("bpmn_token_moves", {"from": "a"}),
+    ],
+)
+def test_wrong_typed_bpmn_value_is_refused_before_the_write(key, value):
+    """Объект в bpmn_node_id или строка в bpmn_token_moves ушли бы в Pyrus как есть."""
+    client = FakeClient()
+    with pytest.raises(ToolError, match=key):
+        _call(
+            _build(client, Mode.NON_DESTRUCTIVE),
+            "comment_task",
+            {"entity_id": 1, "request": {key: value}},
+        )
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("value", [["<b>x</b>"], [], 0, {}])
+def test_non_string_formatted_text_is_refused_before_the_write(value):
+    """Пустой список не должен молча выпасть: тогда ушёл бы пустой комментарий."""
+    client = FakeClient()
+    with pytest.raises(ToolError, match="строкой с HTML"):
+        _call(
+            _build(client, Mode.NON_DESTRUCTIVE),
+            "comment_task",
+            {"entity_id": 1, "request": {"formatted_text": value}},
+        )
+    assert client.calls == []
+
+
+def test_comment_task_description_teaches_formatting_and_mentions():
+    text = server._describe(_spec("comment_task"), Mode.NON_DESTRUCTIVE)
+    assert "formatted_text" in text
+    assert 'data-type="user-mention"' in text
+    assert "<br>" in text and "&amp;" in text
+    assert "в ответе этого же вызова" in text
+    assert "get_contacts / get_members" in text
+
+
+def test_specs_without_extra_keys_get_no_formatting_hint():
+    assert "formatted_text" not in server._describe(_spec("create_role"), Mode.NON_DESTRUCTIVE)
 
 
 def test_missing_required_key_is_named():
@@ -332,6 +679,18 @@ def test_id_req_shape_passes_id_then_request():
     assert args[1].text == "ок"
 
 
+def test_formatted_text_reaches_pyrus_through_the_tool():
+    client = FakeClient()
+    _call(
+        _build(client, Mode.NON_DESTRUCTIVE),
+        "comment_task",
+        {"entity_id": 42, "request": {"formatted_text": "<b>ок</b>"}},
+    )
+    request = client.calls[0][1][1]
+    assert request.formatted_text == "<b>ок</b>"
+    assert "text" not in vars(request)
+
+
 def test_guard_blocks_the_call_before_it_reaches_pyrus():
     client = FakeClient()
     mcp = _build(client, Mode.NON_DESTRUCTIVE)
@@ -432,18 +791,25 @@ def test_negative_offset_is_refused_before_the_write_happens():
     assert client.calls == []
 
 
-def test_positive_offset_on_a_write_does_not_order_a_second_write():
-    """create_task отвечает без списка верхнего уровня. Модель обязана получить
-    id созданной задачи, а не приказ повторить вызов."""
+def test_positive_offset_on_a_write_is_refused_before_the_write():
+    """Окно пишущего вызова со сдвигом — это вторая задача ради того же ответа.
+    Отказ до вызова ничего не теряет: записи ещё не было."""
     client = FakeClient(result=FakeResponse({"task": {"id": 42}}))
-    out = _call(
-        _build(client, Mode.NON_DESTRUCTIVE),
-        "create_task",
-        {"request": {"text": "x"}, "offset": 5},
-    )
-    assert out.data["task"] == {"id": 42}
-    assert out.data["_pagination"]["field"] is None
-    assert [c[0] for c in client.calls] == ["create_task"]
+    with pytest.raises(ToolError, match="повторную запись"):
+        _call(
+            _build(client, Mode.NON_DESTRUCTIVE),
+            "create_task",
+            {"request": {"text": "x"}, "offset": 5},
+        )
+    assert client.calls == []
+
+
+def test_positive_offset_after_a_write_still_returns_the_result():
+    """_adapt зовут и мимо инструментов. Там запись уже состоялась, и отказ
+    потерял бы id созданной задачи."""
+    out = server._adapt(FakeResponse({"task": {"id": 42}}), 5, 1024, write=True)
+    assert out["task"] == {"id": 42}
+    assert out["_pagination"]["field"] is None
 
 
 # --- download_file: инлайн, без записи на диск -----------------------------

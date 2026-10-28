@@ -46,6 +46,17 @@ class Spec:
     request: str | None = None  # имя класса из pyrus.models.requests
     guard: Callable[[dict], str | None] | None = None
     id_arg: str = "entity_id"  # человекочитаемое имя первого позиционного аргумента
+    # Ключи Pyrus API, которых не знает request-класс upstream: ставятся на
+    # объект запроса после конструктора и уходят в тело через jsonpickle.
+    extra_keys: tuple[str, ...] = ()
+    # Ключи, у которых явный false значим. Upstream ставит атрибут только для
+    # истинного значения (`if apply: self.apply = apply`), и false до тела
+    # запроса не доходит, поэтому он ставится на объект после конструктора.
+    keep_false: tuple[str, ...] = ()
+    # Вызов пишущего уровня, который с этим payload ничего не пишет. Только ему
+    # разрешён offset и отдаётся next_offset: у остальных следующее окно — это
+    # повторная запись, то есть дубль.
+    dry_run: Callable[[dict], bool] | None = None
 
 
 # --- guard'ы payload -------------------------------------------------------
@@ -60,12 +71,16 @@ def _guard_update_catalog_items(payload: dict) -> str | None:
     return None
 
 
+def _sync_catalog_dry_run(payload: dict) -> bool:
+    return payload.get("apply") is False
+
+
 def _guard_sync_catalog(payload: dict) -> str | None:
-    if payload.get("apply") is not False:
+    if not _sync_catalog_dry_run(payload):
         return (
             "'apply' в любом значении, кроме явного false — синхронизация с apply=true "
-            "удаляет строки, которых нет во входных данных, а пропущенный ключ "
-            "трактуется сервером Pyrus как apply=true"
+            "удаляет строки, которых нет во входных данных, а умолчание для "
+            "пропущенного ключа в документации Pyrus не описано"
         )
     return None
 
@@ -111,15 +126,40 @@ CATALOG: tuple[Spec, ...] = (
     Spec("get_knowledge_base_permissions", Level.READ, Shape.BY_ID),
     Spec("download_file", Level.READ, Shape.ONE_OFF),
     # WRITE — 17
-    Spec("create_task", Level.WRITE, Shape.REQ, "CreateTaskRequest"),
-    Spec("comment_task", Level.WRITE, Shape.ID_REQ, "TaskCommentRequest", id_arg="task_id"),
-    Spec("create_announcement", Level.WRITE, Shape.REQ, "CreateAnnouncementRequest"),
+    Spec(
+        "create_task",
+        Level.WRITE,
+        Shape.REQ,
+        "CreateTaskRequest",
+        extra_keys=("formatted_text",),
+    ),
+    Spec(
+        "comment_task",
+        Level.WRITE,
+        Shape.ID_REQ,
+        "TaskCommentRequest",
+        id_arg="task_id",
+        extra_keys=(
+            "formatted_text",
+            "bpmn_node_id",
+            "bpmn_resume_processing",
+            "bpmn_token_moves",
+        ),
+    ),
+    Spec(
+        "create_announcement",
+        Level.WRITE,
+        Shape.REQ,
+        "CreateAnnouncementRequest",
+        extra_keys=("formatted_text",),
+    ),
     Spec(
         "comment_announcement",
         Level.WRITE,
         Shape.ID_REQ,
         "AnnouncementCommentRequest",
         id_arg="announcement_id",
+        extra_keys=("formatted_text",),
     ),
     Spec("upload_file", Level.WRITE, Shape.ONE_OFF),
     Spec("create_catalog", Level.WRITE, Shape.REQ, "CreateCatalogRequest"),
@@ -138,6 +178,10 @@ CATALOG: tuple[Spec, ...] = (
         "SyncCatalogRequest",
         _guard_sync_catalog,
         id_arg="catalog_id",
+        keep_false=("apply",),
+        # Без offset дифф dry-run дальше первого окна недостижим. apply=true
+        # (только в full) пишущий: его повтор — вторая синхронизация.
+        dry_run=_sync_catalog_dry_run,
     ),
     Spec("create_role", Level.WRITE, Shape.REQ, "CreateRoleRequest"),
     Spec(

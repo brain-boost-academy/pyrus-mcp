@@ -30,6 +30,27 @@ def test_every_req_shape_names_a_request_class():
     assert missing == []
 
 
+def test_extra_keys_are_still_unknown_upstream():
+    """extra_keys вынимаются из payload до конструктора. Если upstream сам
+    научится такому ключу, обход молча обойдёт его логику — пора его убрать."""
+    for spec in CATALOG:
+        if spec.extra_keys:
+            assert spec.request, spec.method
+            upstream = inspect.signature(getattr(pyrus_requests, spec.request).__init__).parameters
+            assert not set(spec.extra_keys) & set(upstream), spec.method
+
+
+def test_keep_false_keys_are_still_dropped_upstream():
+    """keep_false чинит `if apply: self.apply = apply`. Ключ обязан быть в
+    сигнатуре, а false — по-прежнему теряться: иначе обход не нужен."""
+    for spec in CATALOG:
+        for key in spec.keep_false:
+            assert spec.request, spec.method
+            cls = getattr(pyrus_requests, spec.request)
+            assert key in inspect.signature(cls.__init__).parameters, (spec.method, key)
+            assert key not in vars(cls(**{key: False})), (spec.method, key)
+
+
 def test_no_upstream_method_is_missing_from_the_table():
     """Обратная сверка: новый метод в pyrus-api не должен пройти незамеченным."""
     upstream = {
